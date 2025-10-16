@@ -56,6 +56,7 @@ import logging
 import os
 import re
 import sys
+import time
 from dataclasses import dataclass
 from functools import cache
 from logging import getLogger
@@ -520,6 +521,82 @@ def print_stack(st: list[StackEntry], *, links: bool, level: int = 1) -> None:
     log(b("Stack:"), level=level)
     for e in reversed(st):
         log("   * " + e.pprint(links=links), level=level)
+
+
+def get_remote_commit_id(remote: str, branch: str) -> str | None:
+    """Get the commit ID of a remote branch, or None if it doesn't exist."""
+    try:
+        return get_command_output(
+            ["git", "rev-parse", f"{remote}/{branch}"]
+        ).strip()
+    except SubprocessError:
+        return None
+
+
+def print_stack_view(st: list[StackEntry], args: CommonArgs) -> None:
+    """Print a beautiful, structured view of the stack with status information."""
+    if not st:
+        log(h("📭 Empty stack - no commits to display\n"))
+        return
+
+    log(b("\nStack (oldest → newest):"))
+    log("─" * 80)
+
+    for idx, e in enumerate(st):
+        local_commit_id = e.commit.commit_id()
+        remote_commit_id = None
+        will_change = False
+        status_icon = ""
+        status_text = ""
+
+        # Determine status
+        if e.has_pr() and e.has_head():
+            remote_commit_id = get_remote_commit_id(args.remote, e.head)
+            if remote_commit_id:
+                will_change = local_commit_id != remote_commit_id
+                if will_change:
+                    status_icon = "⚠️ "
+                    status_text = red(" [MODIFIED - will update on export]")
+                else:
+                    status_icon = "✓ "
+                    status_text = green(" [UP TO DATE]")
+            else:
+                status_icon = "🆕 "
+                status_text = blue(" [NEW - will create branch on export]")
+        else:
+            status_icon = "➕ "
+            status_text = blue(" [NEW - will create PR on export]")
+
+        # Print commit header
+        log(f"\n{idx + 1}. {status_icon}{b(local_commit_id[:8])} {status_text}")
+
+        # Print commit title
+        title = e.commit.title()
+        if args.hyperlinks and e.has_pr():
+            log(f"   {link(e.pr, '📝 ' + title)}")
+        else:
+            log(f"   📝 {title}")
+
+        # Print PR info if available
+        if e.has_pr():
+            pr_num = blue("#" + last(e.pr))
+            log(f"   🔗 PR: {pr_num}")
+            if args.hyperlinks:
+                log(f"      {e.pr}")
+
+        # Print branch info
+        if e.has_head():
+            head_str = green(e.head)
+            base_str = green(e.base) if e.base else red("None")
+            log(f"   🌿 Branch: {head_str} → {base_str}")
+
+        # Show commit ID comparison if modified
+        if will_change and remote_commit_id:
+            log(f"   📍 Local:  {local_commit_id[:12]}")
+            log(f"   📍 Remote: {remote_commit_id[:12]}")
+
+    # Footer
+    log("\n" + "─" * 80 + "\n")
 
 
 def draft_bitmask_type(value: str) -> list[bool]:
@@ -1069,7 +1146,58 @@ def rebase_pr(e: StackEntry, remote: str, target: str, *, verbose: bool) -> None
     )
 
 
-def land_pr(e: StackEntry, remote: str, target: str, *, verbose: bool) -> None:
+def wait_for_pr_merge(e: StackEntry, *, timeout: int = 600, poll_interval: int = 5) -> None:
+    """Wait for a PR to be merged by polling its status.
+
+    Args:
+        e: StackEntry containing the PR to wait for.
+        timeout: Maximum time to wait in seconds (default 10 minutes).
+        poll_interval: Time to wait between polls in seconds (default 5 seconds).
+
+    Raises:
+        TimeoutError: If the PR is not merged within the timeout period.
+        RuntimeError: If the PR state becomes invalid (e.g., closed without merging).
+    """
+    pr_id = blue("#" + last(e.pr))
+    log(b(f"Waiting for PR {pr_id} to merge..."), level=1)
+    log("  (This may take a few minutes if there's a merge queue)", level=1)
+    start_time = time.time()
+    last_status_elapsed = 0.0
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+            raise TimeoutError(
+                f"PR {e.pr} did not merge within {timeout} seconds. "
+                "It may still be in the merge queue."
+            )
+
+        # Show progress every 30 seconds
+        if elapsed - last_status_elapsed >= 30:
+            minutes_elapsed = int(elapsed / 60)
+            log(f"  Still waiting... ({minutes_elapsed}m elapsed)", level=1)
+            last_status_elapsed = elapsed
+
+        # Check PR status
+        pr_info = get_command_output(
+            ["gh", "pr", "view", e.pr, "--json", "state,mergedAt"]
+        )
+        d = json.loads(pr_info)
+
+        if d["state"] == "MERGED" and d["mergedAt"]:
+            log(green(f"✓ PR {pr_id} merged successfully!"), level=1)
+            return
+
+        if d["state"] == "CLOSED":
+            raise RuntimeError(
+                f"PR {e.pr} was closed without merging. Cannot continue landing."
+            )
+
+        # Still open, wait and poll again
+        time.sleep(poll_interval)
+
+
+def land_pr(e: StackEntry, remote: str, target: str, *, verbose: bool, wait_for_merge: bool = False) -> None:
     log(b("Landing ") + e.pprint(links=False), level=2)
     # Rebase the head branch to the most recent 'origin/main'
     run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
@@ -1098,6 +1226,10 @@ def land_pr(e: StackEntry, remote: str, target: str, *, verbose: bool) -> None:
         input=pr_body.encode(),
         quiet=not verbose,
     )
+
+    # Wait for merge to complete if requested (useful with merge queues)
+    if wait_for_merge:
+        wait_for_pr_merge(e)
 
 
 def delete_local_branches(st: list[StackEntry], *, verbose: bool) -> None:
@@ -1135,8 +1267,16 @@ def delete_remote_branches(
 # ===----------------------------------------------------------------------=== #
 # Entry point for 'land' command
 # ===----------------------------------------------------------------------=== #
-def command_land(args: CommonArgs) -> None:
+def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
     log(h("LAND"), level=1)
+
+    # By default, we wait for merge to complete. Only skip if explicitly requested.
+    wait_for_merge = not skip_wait
+
+    if skip_wait:
+        log(red("\n⚠️  WARNING: --skip-wait is enabled!"))
+        log("   The PR will be queued for merge, but the rest of the stack will NOT be rebased.")
+        log("   You will need to manually rebase the remaining PRs after the merge completes.\n")
 
     current_branch = get_current_branch_name()
 
@@ -1169,7 +1309,18 @@ def command_land(args: CommonArgs) -> None:
     verify(st, check_base=True)
 
     # All good, land the bottommost PR!
-    land_pr(st[0], remote=args.remote, target=args.target, verbose=args.verbose)
+    land_pr(st[0], remote=args.remote, target=args.target, verbose=args.verbose, wait_for_merge=wait_for_merge)
+
+    if skip_wait:
+        # User explicitly skipped waiting, so we skip rebasing
+        log(h("\n⚠️  Skipping rebase of remaining stack (--skip-wait enabled)"), level=1)
+        log("   The first PR has been queued for merge.")
+        if len(st) > 1:
+            log(f"   Remaining {len(st) - 1} PR(s) in the stack will need manual rebasing after merge completes.")
+        run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
+        delete_local_branches(st, verbose=args.verbose)
+        log(h(blue("\nMerge initiated! Remember to rebase remaining PRs manually.")))
+        return
 
     # The rest of the stack now needs to be rebased.
     if len(st) > 1:
@@ -1325,7 +1476,8 @@ def print_tips_after_view(st: list[StackEntry], args: CommonArgs) -> None:
 # Entry point for 'view' command
 # ===----------------------------------------------------------------------=== #
 def command_view(args: CommonArgs) -> None:
-    log(h("VIEW"))
+    # Fetch remote to ensure we have up-to-date branch information
+    run_shell_command(["git", "fetch", "--prune", args.remote], quiet=not args.verbose)
 
     if should_update_local_base(
         head=args.head,
@@ -1334,21 +1486,11 @@ def command_view(args: CommonArgs) -> None:
         target=args.target,
         verbose=args.verbose,
     ):
-        log(
-            red(
-                f"\nWarning: Local '{args.base}' is behind"
-                f" '{args.remote}/{args.target}'!"
-            ),
-        )
-        log(
-            ("Consider updating your local branch by running the following commands:"),
-        )
-        log(
-            b(f"   git rebase {args.remote}/{args.target} {args.base}"),
-        )
-        log(
-            b(f"   git checkout {get_current_branch_name()}\n"),
-        )
+        log("\n" + "⚠️  " + red("Warning: Local branch is behind remote!"))
+        log(f"    Local '{args.base}' is behind '{args.remote}/{args.target}'")
+        log("\n    Consider updating with:")
+        log(b(f"      git rebase {args.remote}/{args.target} {args.base}"))
+        log(b(f"      git checkout {get_current_branch_name()}"))
 
     st = get_stack(base=args.base, head=args.head, verbose=args.verbose)
 
@@ -1359,9 +1501,7 @@ def command_view(args: CommonArgs) -> None:
         branch_name_template=args.branch_name_template,
     )
     set_base_branches(st, target=args.target)
-    print_stack(st, links=args.hyperlinks)
-    print_tips_after_view(st, args)
-    log(h(blue("SUCCESS!")))
+    print_stack_view(st, args)
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1451,10 +1591,16 @@ def create_argparser(
         help="Stash all uncommited changes before submitting the PR",
     )
 
-    subparsers.add_parser(
+    parser_land = subparsers.add_parser(
         "land",
         help="Land the current stack",
         parents=[common_parser],
+    )
+    parser_land.add_argument(
+        "--skip-wait",
+        action="store_true",
+        default=config.getboolean("land", "skip_wait", fallback=False),
+        help="Skip waiting for PR to merge (NOT RECOMMENDED - you will need to manually rebase the rest of the stack)",
     )
     subparsers.add_parser(
         "abandon",
@@ -1518,7 +1664,7 @@ def main() -> None:  # noqa: PLR0912
                 draft_bitmask=args.draft_bitmask,
             )
         elif args.command == "land":
-            command_land(common_args)
+            command_land(common_args, skip_wait=args.skip_wait)
         elif args.command == "abandon":
             command_abandon(common_args)
         elif args.command == "view":
