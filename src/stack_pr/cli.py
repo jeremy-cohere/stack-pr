@@ -57,12 +57,17 @@ import os
 import re
 import sys
 import time
+from collections.abc import Generator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from logging import getLogger
 from pathlib import Path
 from re import Pattern
 from subprocess import SubprocessError
+
+from rich.console import Console
+from rich.status import Status
 
 from stack_pr.git import (
     branch_exists,
@@ -395,6 +400,74 @@ def log(msg: str, *, level: int = 1) -> None:
 
 
 # ===----------------------------------------------------------------------=== #
+# Rich console utilities
+# ===----------------------------------------------------------------------=== #
+"""Rich console utilities for modern CLI output with spinners and status indicators.
+
+Usage patterns:
+    Simple status: with status("Adding cross-links to PRs"): ...
+    With updates: with status("Creating PR") as s: s.update("message")
+    Messages: print_success("Done!"), print_error("Failed!"), print_info("Info")
+    Verbose-only: with status("Operation", level=2): ...
+"""
+
+# Global console instance for rich output
+console = Console()
+
+
+@contextmanager
+def status(
+    message: str, *, level: int = 1, spinner: str = "dots"
+) -> Generator[Status, None, None]:
+    """Context manager for showing status with a spinner.
+
+    Usage:
+        with status("Adding cross-links to PRs"):
+            # do work
+            pass
+
+        # Or with custom success/error messages:
+        with status("Creating PR") as s:
+            # do work
+            s.update("Almost done...")
+
+    Args:
+        message: The message to display during the operation
+        level: Logging level (1 = always show, 2+ = verbose only)
+        spinner: Spinner style (dots, line, arc, etc.)
+    """
+    if level <= 1:
+        with console.status(f"[bold cyan]{message}...", spinner=spinner) as s:
+            yield s
+            # On success, we'll print a checkmark
+            console.print(f"[green]✓[/green] {message}")
+    else:
+        # For higher verbosity levels, just log without spinner
+        logger.info(message)
+        yield Status(message, console=console, spinner=spinner)
+
+
+def print_success(message: str) -> None:
+    """Print a success message with a checkmark."""
+    console.print(f"[bold green]✓ {message}[/bold green]")
+
+
+def print_error(message: str) -> None:
+    """Print an error message with an X mark."""
+    console.print(f"[bold red]✗ {message}[/bold red]")
+
+
+def print_info(message: str) -> None:
+    """Print an info message."""
+    console.print(f"[bold cyan]→ {message}[/bold cyan]")
+
+
+def print_warning(message: str) -> None:
+    """Print a warning message."""
+    console.print(f"[bold yellow]⚠ {message}[/bold yellow]")
+
+
+# ===----------------------------------------------------------------------=== #
 # Common utility functions
 # ===----------------------------------------------------------------------=== #
 def split_header(s: str) -> list[CommitHeader]:
@@ -564,7 +637,7 @@ def print_stack_view(st: list[StackEntry], args: CommonArgs) -> None:
                 status_icon = "🆕 "
                 status_text = blue(" [NEW - will create branch on export]")
         else:
-            status_icon = "➕ "
+            status_icon = "❇️ "
             status_text = blue(" [NEW - will create PR on export]")
 
         # Print commit header
@@ -691,7 +764,9 @@ def generate_available_branch_name(refs: list[str], branch_name_template: str) -
     return generate_branch_name(branch_name_template, new_branch_id)
 
 
-def get_available_branch_name(remote: str, branch_name_template: str) -> str:
+def get_available_branch_name(
+    remote: str, branch_name_template: str, existing_branches: list[str] | None = None
+) -> str:
     branch_name_base = get_branch_name_base(branch_name_template)
 
     git_command_branch_template = branch_name_base.replace(r"$ID", "*")
@@ -705,6 +780,11 @@ def get_available_branch_name(remote: str, branch_name_template: str) -> str:
     ).split()
 
     refs = [ref.strip("'") for ref in refs]
+
+    # Also include branches already assigned in the current stack
+    if existing_branches:
+        refs.extend([f"refs/remotes/{remote}/{b}" for b in existing_branches])
+
     return generate_available_branch_name(refs, branch_name_template)
 
 
@@ -716,10 +796,18 @@ def get_next_available_branch_name(branch_name_template: str, name: str) -> str:
 def set_head_branches(
     st: list[StackEntry], remote: str, *, verbose: bool, branch_name_template: str
 ) -> None:
-    """Set the head ref for each stack entry if it doesn't already have one."""
+    """Set the head ref for each stack entry if it doesn't already have one.
+
+    Takes into account branches already assigned in the stack to avoid conflicts.
+    """
 
     run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
-    available_name = get_available_branch_name(remote, branch_name_template)
+
+    # Collect branches already assigned in this stack and find next available
+    existing_branches = [e.head for e in st if e.has_head()]
+    available_name = get_available_branch_name(remote, branch_name_template, existing_branches)
+
+    # Assign branches to entries without heads
     for e in filter(lambda e: not e.has_head(), st):
         e.head = available_name
         available_name = get_next_available_branch_name(
@@ -980,19 +1068,6 @@ def deduce_base(args: CommonArgs) -> CommonArgs:
     )
 
 
-def print_tips_after_export(st: list[StackEntry], args: CommonArgs) -> None:
-    stack_size = len(st)
-    if stack_size == 0:
-        return
-
-    top_commit = args.head
-    if top_commit == "HEAD":
-        top_commit = get_current_branch_name()
-
-    log(b("\nOnce the stack is reviewed, it is ready to land!"), level=1)
-    log(LAND_STACK_TIP.format(**locals()))
-
-
 # ===----------------------------------------------------------------------=== #
 # Entry point for 'submit' command
 # ===----------------------------------------------------------------------=== #
@@ -1069,50 +1144,49 @@ def command_submit(
     push_branches(st, remote=args.remote, verbose=args.verbose)
 
     # Now we have all the branches, so we can create the corresponding PRs
-    log(h("Submitting PRs"), level=1)
-    for e_idx, e in enumerate(st):
-        is_pr_draft = draft or ((draft_bitmask is not None) and draft_bitmask[e_idx])
-        create_pr(e, is_draft=is_pr_draft, reviewer=reviewer)
+    with status("Submitting PRs"):
+        for e_idx, e in enumerate(st):
+            is_pr_draft = draft or ((draft_bitmask is not None) and draft_bitmask[e_idx])
+            create_pr(e, is_draft=is_pr_draft, reviewer=reviewer)
 
-    # Verify consistency in everything we have so far
-    verify(st)
+        # Verify consistency in everything we have so far
+        verify(st)
 
     # Embed stack-info into commit messages
-    log(h("Updating commit messages with stack metadata"), level=1)
-    needs_rebase = False
-    for e in st:
-        try:
-            needs_rebase = add_or_update_metadata(
-                e, needs_rebase=needs_rebase, verbose=args.verbose
-            )
-        except Exception:
-            error(ERROR_CANT_UPDATE_META.format(**locals()))
-            raise
+    with status("Updating commit messages with stack metadata"):
+        needs_rebase = False
+        for e in st:
+            try:
+                needs_rebase = add_or_update_metadata(
+                    e, needs_rebase=needs_rebase, verbose=args.verbose
+                )
+            except Exception:
+                error(ERROR_CANT_UPDATE_META.format(**locals()))
+                raise
 
     push_branches(st, remote=args.remote, verbose=args.verbose)
 
-    log(h("Adding cross-links to PRs"), level=1)
-    add_cross_links(st, keep_body=keep_body, verbose=args.verbose)
+    with status("Adding cross-links to PRs"):
+        add_cross_links(st, keep_body=keep_body, verbose=args.verbose)
 
     if need_to_rebase_current:
-        log(h(f"Rebasing the original branch '{current_branch}'"), level=1)
-        run_shell_command(
-            [
-                "git",
-                "rebase",
-                top_branch,
-                current_branch,
-                "--committer-date-is-author-date",
-            ],
-            quiet=not args.verbose,
-        )
+        with status(f"Rebasing the original branch '{current_branch}'"):
+            run_shell_command(
+                [
+                    "git",
+                    "rebase",
+                    top_branch,
+                    current_branch,
+                    "--committer-date-is-author-date",
+                ],
+                quiet=not args.verbose,
+            )
     else:
-        log(h(f"Checking out the original branch '{current_branch}'"), level=1)
-        run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
+        with status(f"Checking out the original branch '{current_branch}'"):
+            run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
 
     delete_local_branches(st, verbose=args.verbose)
-    print_tips_after_export(st, args)
-    log(h(blue("SUCCESS!")), level=1)
+    print_success("Export completed successfully!")
 
 
 # ===----------------------------------------------------------------------=== #

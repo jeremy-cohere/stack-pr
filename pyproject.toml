@@ -28,7 +28,10 @@ classifiers = [
 ]
 # Version is dynamically set by pdm by the SCM version
 dynamic = ["version"]
-dependencies = ["typing_extensions; python_version<\"3.13\""]
+dependencies = [
+    "typing_extensions; python_version<\"3.13\"",
+    "rich>=13.0.0",
+]
 
 [project.optional-dependencies]
 dev = [
