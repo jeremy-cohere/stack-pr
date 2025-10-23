@@ -1,8 +1,8 @@
-# stack-pr: a tool for working with stacked PRs on github.
+# git-stack: a tool for working with stacked PRs on github.
 #
-# ---------------
-# stack-pr submit
-# ---------------
+# -----------------
+# git stack submit
+# -----------------
 #
 # Semantics:
 #  1. Find merge-base (the most recent commit from 'main' in the current branch)
@@ -21,9 +21,9 @@
 # branch of each PR will be the head branch of the previous PR, or 'main' for
 # the first PR in the stack.
 #
-# -------------
-# stack-pr land
-# -------------
+# ---------------
+# git stack land
+# ---------------
 #
 # Semantics:
 #  1. Find merge-base (the most recent commit from 'main' in the current branch)
@@ -36,9 +36,9 @@
 # If 'land' succeeds, all the PRs from the stack will be merged into 'main',
 # all the corresponding remote and local branches deleted.
 #
-# ----------------
-# stack-pr abandon
-# ----------------
+# ------------------
+# git stack abandon
+# ------------------
 #
 # Semantics:
 # For all commits in the stack that have valid stack-info:
@@ -183,17 +183,17 @@ Please complete or abort the current rebase first.
 """
 UPDATE_STACK_TIP = """
 If you'd like to push your local changes first, you can use the following command to update the stack:
-  $ stack-pr export -B {top_commit}~{stack_size} -H {top_commit}"""
+  $ git stack export -B {top_commit}~{stack_size} -H {top_commit}"""
 EXPORT_STACK_TIP = """
 You can use the following command to do that:
-  $ stack-pr export -B {top_commit}~{stack_size} -H {top_commit}
+  $ git stack export -B {top_commit}~{stack_size} -H {top_commit}
 """
 LAND_STACK_TIP = """
 To land it, you could run:
-  $ stack-pr land -B {top_commit}~{stack_size} -H {top_commit}
+  $ git stack land -B {top_commit}~{stack_size} -H {top_commit}
 
 If you'd like to land stack except the top N commits, you could use the following command:
-  $ stack-pr land -B {top_commit}~{stack_size} -H {top_commit}~N
+  $ git stack land -B {top_commit}~{stack_size} -H {top_commit}~N
 
 If you prefer to merge via the github web UI, please don't forget to edit commit message on the merge page!
 If you use the default commit message filled by the web UI, links to other PRs from the stack will be included in the commit message.
@@ -406,13 +406,40 @@ def log(msg: str, *, level: int = 1) -> None:
 
 Usage patterns:
     Simple status: with status("Adding cross-links to PRs"): ...
-    With updates: with status("Creating PR") as s: s.update("message")
+    With hierarchy: with status_group("Submitting PRs"):
+                       with status("Creating PR #1"): ...
     Messages: print_success("Done!"), print_error("Failed!"), print_info("Info")
-    Verbose-only: with status("Operation", level=2): ...
 """
 
 # Global console instance for rich output
 console = Console()
+
+# Stack to track hierarchical status context (for showing parent > child)
+_status_stack: list[str] = []
+
+
+@contextmanager
+def status_group(message: str, *, level: int = 1) -> Generator[None, None, None]:
+    """Context manager for grouping related operations with hierarchy.
+
+    Usage:
+        with status_group("Submitting PRs"):
+            for pr in prs:
+                with status(f"Creating PR {pr.id}"):
+                    create_pr(pr)
+
+    Args:
+        message: The parent operation message
+        level: Logging level (1 = always show, 2+ = verbose only)
+    """
+    if level <= 1:
+        console.print(f"\n[bold cyan]▶ {message}[/bold cyan]")
+        _status_stack.append(message)
+    try:
+        yield
+    finally:
+        if level <= 1:
+            _status_stack.pop()
 
 
 @contextmanager
@@ -421,14 +448,15 @@ def status(
 ) -> Generator[Status, None, None]:
     """Context manager for showing status with a spinner.
 
+    Automatically shows hierarchy if inside a status_group.
+
     Usage:
         with status("Adding cross-links to PRs"):
             # do work
             pass
 
-        # Or with custom success/error messages:
+        # Or with custom updates:
         with status("Creating PR") as s:
-            # do work
             s.update("Almost done...")
 
     Args:
@@ -437,10 +465,17 @@ def status(
         spinner: Spinner style (dots, line, arc, etc.)
     """
     if level <= 1:
-        with console.status(f"[bold cyan]{message}...", spinner=spinner) as s:
+        # Build hierarchical message
+        indent = "  " * len(_status_stack)
+        if _status_stack:
+            display_msg = f"{indent}[cyan]→[/cyan] {message}"
+        else:
+            display_msg = f"[bold cyan]{message}[/bold cyan]"
+
+        with console.status(f"{display_msg}...", spinner=spinner) as s:
             yield s
-            # On success, we'll print a checkmark
-            console.print(f"[green]✓[/green] {message}")
+            # On success, show checkmark
+            console.print(f"{indent}[green]✓[/green] {message}")
     else:
         # For higher verbosity levels, just log without spinner
         logger.info(message)
@@ -534,7 +569,6 @@ def set_base_branches(st: list[StackEntry], target: str) -> None:
 
 
 def verify(st: list[StackEntry], *, check_base: bool = False) -> None:
-    log(h("Verifying stack info"))
     for index, e in enumerate(st):
         if e.has_missing_info():
             error(ERROR_STACKINFO_MISSING.format(**locals()))
@@ -818,22 +852,22 @@ def set_head_branches(
 def init_local_branches(
     st: list[StackEntry], remote: str, *, verbose: bool, branch_name_template: str
 ) -> None:
-    log(h("Initializing local branches"))
-    set_head_branches(
-        st, remote, verbose=verbose, branch_name_template=branch_name_template
-    )
-    for e in st:
-        run_shell_command(
-            ["git", "checkout", e.commit.commit_id(), "-B", e.head],
-            quiet=not verbose,
+    with status("Initializing local branches"):
+        set_head_branches(
+            st, remote, verbose=verbose, branch_name_template=branch_name_template
         )
+        for e in st:
+            run_shell_command(
+                ["git", "checkout", e.commit.commit_id(), "-B", e.head],
+                quiet=not verbose,
+            )
 
 
 def push_branches(st: list[StackEntry], remote: str, *, verbose: bool) -> None:
-    log(h("Updating remote branches"))
-    cmd = ["git", "push", "-f", remote]
-    cmd.extend([f"{e.head}:{e.head}" for e in st])
-    run_shell_command(cmd, quiet=not verbose)
+    with status("Pushing branches to remote"):
+        cmd = ["git", "push", "-f", remote]
+        cmd.extend([f"{e.head}:{e.head}" for e in st])
+        run_shell_command(cmd, quiet=not verbose)
 
 
 def print_cmd_failure_details(exc: SubprocessError) -> None:
@@ -864,33 +898,34 @@ def create_pr(e: StackEntry, *, is_draft: bool, reviewer: str = "") -> None:
     if not e.has_base() or not e.has_head():
         error("Stack entry has no base or head branch")
         raise RuntimeError
-    log(h("Creating PR " + green(f"'{e.head}' -> '{e.base}'")), level=1)
-    cmd = [
-        "gh",
-        "pr",
-        "create",
-        "-B",
-        e.base or "",
-        "-H",
-        e.head or "",
-        "-t",
-        e.commit.title(),
-        "-F",
-        "-",
-    ]
-    if reviewer:
-        cmd.extend(["--reviewer", reviewer])
-    if is_draft:
-        cmd.append("--draft")
 
-    try:
-        r = get_command_output(cmd, input=e.commit.commit_msg().encode())
-    except Exception:
-        error(ERROR_CANT_CREATE_PR.format(**locals()))
-        raise
+    with status(f"Creating PR for {e.commit.commit_id()[:8]}: {e.commit.title()[:50]}"):
+        cmd = [
+            "gh",
+            "pr",
+            "create",
+            "-B",
+            e.base or "",
+            "-H",
+            e.head or "",
+            "-t",
+            e.commit.title(),
+            "-F",
+            "-",
+        ]
+        if reviewer:
+            cmd.extend(["--reviewer", reviewer])
+        if is_draft:
+            cmd.append("--draft")
 
-    log(b("Created: ") + r, level=2)
-    e.pr = r.split()[-1]
+        try:
+            r = get_command_output(cmd, input=e.commit.commit_msg().encode())
+        except Exception:
+            error(ERROR_CANT_CREATE_PR.format(**locals()))
+            raise
+
+        log(b("Created: ") + r, level=2)
+        e.pr = r.split()[-1]
 
 
 def generate_toc(st: list[StackEntry], current: str) -> str:
@@ -978,10 +1013,9 @@ def add_cross_links(st: list[StackEntry], *, keep_body: bool, verbose: bool) -> 
 def reset_remote_base_branches(
     st: list[StackEntry], target: str, *, verbose: bool
 ) -> None:
-    log(h("Resetting remote base branches"), level=1)
-
-    for e in filter(lambda e: e.has_pr(), st):
-        run_shell_command(["gh", "pr", "edit", e.pr, "-B", target], quiet=not verbose)
+    with status("Resetting remote base branches"):
+        for e in filter(lambda e: e.has_pr(), st):
+            run_shell_command(["gh", "pr", "edit", e.pr, "-B", target], quiet=not verbose)
 
 
 # If local 'main' lags behind 'origin/main', and 'head' contains all commits
@@ -1089,7 +1123,7 @@ def command_submit(
         draft_bitmask: List of boolean values indicating if each PR should be created as
             a draft.
     """
-    log(h("SUBMIT"), level=1)
+    console.print("\n[bold magenta]╭─── EXPORT STACK ───╮[/bold magenta]")
 
     if is_rebase_in_progress():
         error(ERROR_REBASE_IN_PROGRESS)
@@ -1112,12 +1146,11 @@ def command_submit(
     # Determine what commits belong to the stack
     st = get_stack(base=args.base, head=args.head, verbose=args.verbose)
     if not st:
-        log(h("Empty stack!"))
-        log(h(blue("SUCCESS!")))
+        print_info("Empty stack - nothing to export")
         return
 
     if (draft_bitmask is not None) and (len(draft_bitmask) != len(st)):
-        log(h("Draft bitmask passed to 'submit' doesn't match number of PRs!"))
+        print_error("Draft bitmask length doesn't match number of PRs in stack")
         return
 
     # Create local branches and initialize base and head fields in the stack
@@ -1144,13 +1177,14 @@ def command_submit(
     push_branches(st, remote=args.remote, verbose=args.verbose)
 
     # Now we have all the branches, so we can create the corresponding PRs
-    with status("Submitting PRs"):
+    with status_group("Submitting PRs"):
         for e_idx, e in enumerate(st):
             is_pr_draft = draft or ((draft_bitmask is not None) and draft_bitmask[e_idx])
             create_pr(e, is_draft=is_pr_draft, reviewer=reviewer)
 
         # Verify consistency in everything we have so far
-        verify(st)
+        with status("Verifying stack"):
+            verify(st)
 
     # Embed stack-info into commit messages
     with status("Updating commit messages with stack metadata"):
@@ -1193,156 +1227,166 @@ def command_submit(
 # LAND
 # ===----------------------------------------------------------------------=== #
 def rebase_pr(e: StackEntry, remote: str, target: str, *, verbose: bool) -> None:
-    log(b("Rebasing ") + e.pprint(links=False), level=2)
-    # Rebase the head branch to the most recent 'origin/main'
-    run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
-    cmd = ["git", "checkout", f"{remote}/{e.head}", "-B", e.head]
-    try:
-        run_shell_command(cmd, quiet=not verbose)
-    except Exception:
-        error(ERROR_CANT_CHECKOUT_REMOTE_BRANCH.format(**locals()))
-        raise
+    pr_id = "#" + last(e.pr) if e.has_pr() else e.commit.commit_id()[:8]
+    commit_title = e.commit.title()[:50]
 
-    cmd = [
-        "git",
-        "rebase",
-        f"{remote}/{target}",
-        e.head,
-        "--committer-date-is-author-date",
-    ]
-    try:
-        run_shell_command(cmd, quiet=not verbose)
-    except Exception:
-        error(ERROR_CANT_REBASE.format(**locals()))
-        raise
-    run_shell_command(
-        ["git", "push", remote, "-f", f"{e.head}:{e.head}"], quiet=not verbose
-    )
+    with status(f"Rebasing PR {pr_id}: {commit_title}"):
+        # Rebase the head branch to the most recent 'origin/main'
+        run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
+        cmd = ["git", "checkout", f"{remote}/{e.head}", "-B", e.head]
+        try:
+            run_shell_command(cmd, quiet=not verbose)
+        except Exception:
+            error(ERROR_CANT_CHECKOUT_REMOTE_BRANCH.format(**locals()))
+            raise
+
+        cmd = [
+            "git",
+            "rebase",
+            f"{remote}/{target}",
+            e.head,
+            "--committer-date-is-author-date",
+        ]
+        try:
+            run_shell_command(cmd, quiet=not verbose)
+        except Exception:
+            error(ERROR_CANT_REBASE.format(**locals()))
+            raise
+        run_shell_command(
+            ["git", "push", remote, "-f", f"{e.head}:{e.head}"], quiet=not verbose
+        )
 
 
-def wait_for_pr_merge(e: StackEntry, *, timeout: int = 600, poll_interval: int = 5) -> None:
+def wait_for_pr_merge(e: StackEntry, *, timeout: int = 1800, poll_interval: int = 5) -> None:
     """Wait for a PR to be merged by polling its status.
 
     Args:
         e: StackEntry containing the PR to wait for.
-        timeout: Maximum time to wait in seconds (default 10 minutes).
+        timeout: Maximum time to wait in seconds (default 30 minutes).
         poll_interval: Time to wait between polls in seconds (default 5 seconds).
 
     Raises:
         TimeoutError: If the PR is not merged within the timeout period.
         RuntimeError: If the PR state becomes invalid (e.g., closed without merging).
     """
-    pr_id = blue("#" + last(e.pr))
-    log(b(f"Waiting for PR {pr_id} to merge..."), level=1)
-    log("  (This may take a few minutes if there's a merge queue)", level=1)
+    pr_id = "#" + last(e.pr)
     start_time = time.time()
-    last_status_elapsed = 0.0
 
-    while True:
-        elapsed = time.time() - start_time
-        if elapsed > timeout:
-            raise TimeoutError(
-                f"PR {e.pr} did not merge within {timeout} seconds. "
-                "It may still be in the merge queue."
-            )
+    with console.status(
+        f"[bold yellow]⏳ Waiting for PR {pr_id} to merge...[/bold yellow]",
+        spinner="dots"
+    ) as status_obj:
+        while True:
+            elapsed = time.time() - start_time
+            if elapsed > timeout:
+                raise TimeoutError(
+                    f"PR {e.pr} did not merge within {timeout} seconds. "
+                    "It may still be in the merge queue."
+                )
 
-        # Show progress every 30 seconds
-        if elapsed - last_status_elapsed >= 30:
+            # Update status with elapsed time
             minutes_elapsed = int(elapsed / 60)
-            log(f"  Still waiting... ({minutes_elapsed}m elapsed)", level=1)
-            last_status_elapsed = elapsed
-
-        # Check PR status
-        pr_info = get_command_output(
-            ["gh", "pr", "view", e.pr, "--json", "state,mergedAt"]
-        )
-        d = json.loads(pr_info)
-
-        if d["state"] == "MERGED" and d["mergedAt"]:
-            log(green(f"✓ PR {pr_id} merged successfully!"), level=1)
-            return
-
-        if d["state"] == "CLOSED":
-            raise RuntimeError(
-                f"PR {e.pr} was closed without merging. Cannot continue landing."
+            seconds_elapsed = int(elapsed % 60)
+            status_obj.update(
+                f"[bold yellow]⏳ Waiting for PR {pr_id} to merge... "
+                f"({minutes_elapsed}m {seconds_elapsed}s elapsed)[/bold yellow]"
             )
 
-        # Still open, wait and poll again
-        time.sleep(poll_interval)
+            # Check PR status
+            pr_info = get_command_output(
+                ["gh", "pr", "view", e.pr, "--json", "state,mergedAt"]
+            )
+            d = json.loads(pr_info)
+
+            if d["state"] == "MERGED" and d["mergedAt"]:
+                # Success message will be shown by the caller
+                return
+
+            if d["state"] == "CLOSED":
+                raise RuntimeError(
+                    f"PR {e.pr} was closed without merging. Cannot continue landing."
+                )
+
+            # Still open, wait and poll again
+            time.sleep(poll_interval)
 
 
 def land_pr(e: StackEntry, remote: str, target: str, *, verbose: bool, wait_for_merge: bool = False) -> None:
-    log(b("Landing ") + e.pprint(links=False), level=2)
-    # Rebase the head branch to the most recent 'origin/main'
-    run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
-    cmd = ["git", "checkout", f"{remote}/{e.head}", "-B", e.head]
-    try:
-        run_shell_command(cmd, quiet=not verbose)
-    except Exception:
-        error(ERROR_CANT_CHECKOUT_REMOTE_BRANCH.format(**locals()))
-        raise
+    pr_id = "#" + last(e.pr)
+    commit_title = e.commit.title()[:50]
 
-    # Switch PR base branch to 'main'
-    run_shell_command(["gh", "pr", "edit", e.pr, "-B", target], quiet=not verbose)
+    with status(f"Landing PR {pr_id}: {commit_title}"):
+        # Rebase the head branch to the most recent 'origin/main'
+        run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
+        cmd = ["git", "checkout", f"{remote}/{e.head}", "-B", e.head]
+        try:
+            run_shell_command(cmd, quiet=not verbose)
+        except Exception:
+            error(ERROR_CANT_CHECKOUT_REMOTE_BRANCH.format(**locals()))
+            raise
 
-    # Form the commit message: it should contain the original commit message
-    # and nothing else.
-    pr_body = RE_STACK_INFO_LINE.sub("", e.commit.commit_msg())
+        # Switch PR base branch to 'main'
+        run_shell_command(["gh", "pr", "edit", e.pr, "-B", target], quiet=not verbose)
 
-    # Since title is passed separately, we need to strip the first line from the
-    # body:
-    lines = pr_body.splitlines()
-    pr_id = last(e.pr)
-    title = f"{lines[0]} (#{pr_id})"
-    pr_body = "\n".join(lines[1:]) or " "
-    run_shell_command(
-        ["gh", "pr", "merge", e.pr, "--squash", "-t", title, "-F", "-"],
-        input=pr_body.encode(),
-        quiet=not verbose,
-    )
+        # Form the commit message: it should contain the original commit message
+        # and nothing else.
+        pr_body = RE_STACK_INFO_LINE.sub("", e.commit.commit_msg())
+
+        # Since title is passed separately, we need to strip the first line from the
+        # body:
+        lines = pr_body.splitlines()
+        pr_num = last(e.pr)
+        title = f"{lines[0]} (#{pr_num})"
+        pr_body = "\n".join(lines[1:]) or " "
+        run_shell_command(
+            ["gh", "pr", "merge", e.pr, "--squash", "-t", title, "-F", "-"],
+            input=pr_body.encode(),
+            quiet=not verbose,
+        )
 
     # Wait for merge to complete if requested (useful with merge queues)
     if wait_for_merge:
         wait_for_pr_merge(e)
+        console.print(f"[green]✓ PR {pr_id} merged successfully![/green]")
 
 
 def delete_local_branches(st: list[StackEntry], *, verbose: bool) -> None:
-    log(h("Deleting local branches"), level=1)
-    # Delete local branches
-    cmd = ["git", "branch", "-D"]
-    cmd.extend([e.head for e in st if e.head])
-    run_shell_command(cmd, check=False, quiet=not verbose)
+    with status("Deleting local branches"):
+        # Delete local branches
+        cmd = ["git", "branch", "-D"]
+        cmd.extend([e.head for e in st if e.head])
+        run_shell_command(cmd, check=False, quiet=not verbose)
 
 
 def delete_remote_branches(
     st: list[StackEntry], remote: str, *, verbose: bool, branch_name_template: str
 ) -> None:
-    log(h("Deleting remote branches"), level=1)
-    run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
+    with status("Deleting remote branches"):
+        run_shell_command(["git", "fetch", "--prune", remote], quiet=not verbose)
 
-    branch_name_base = get_branch_name_base(branch_name_template)
-    refs = get_command_output(
-        [
-            "git",
-            "for-each-ref",
-            f"refs/remotes/{remote}/{branch_name_base}",
-            "--format=%(refname)",
-        ]
-    ).split()
-    refs = [x.replace(f"refs/remotes/{remote}/", "") for x in refs]
-    remote_branches_to_delete = [e.head for e in st if e.head in refs]
+        branch_name_base = get_branch_name_base(branch_name_template)
+        refs = get_command_output(
+            [
+                "git",
+                "for-each-ref",
+                f"refs/remotes/{remote}/{branch_name_base}",
+                "--format=%(refname)",
+            ]
+        ).split()
+        refs = [x.replace(f"refs/remotes/{remote}/", "") for x in refs]
+        remote_branches_to_delete = [e.head for e in st if e.head in refs]
 
-    if remote_branches_to_delete:
-        cmd = ["git", "push", "-f", remote]
-        cmd.extend([f":{branch}" for branch in remote_branches_to_delete])
-        run_shell_command(cmd, check=False, quiet=not verbose)
+        if remote_branches_to_delete:
+            cmd = ["git", "push", "-f", remote]
+            cmd.extend([f":{branch}" for branch in remote_branches_to_delete])
+            run_shell_command(cmd, check=False, quiet=not verbose)
 
 
 # ===----------------------------------------------------------------------=== #
 # Entry point for 'land' command
 # ===----------------------------------------------------------------------=== #
 def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
-    log(h("LAND"), level=1)
+    console.print("\n[bold magenta]╭─── LAND STACK ───╮[/bold magenta]")
 
     # By default, we wait for merge to complete. Only skip if explicitly requested.
     wait_for_merge = not skip_wait
@@ -1369,8 +1413,7 @@ def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
     # Determine what commits belong to the stack
     st = get_stack(base=args.base, head=args.head, verbose=args.verbose)
     if not st:
-        log(h("Empty stack!"), level=1)
-        log(h(blue("SUCCESS!")), level=1)
+        print_info("Empty stack - nothing to land")
         return
 
     # Initialize base branches of elements in the stack. Head branches should
@@ -1380,52 +1423,54 @@ def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
     print_stack(st, links=args.hyperlinks)
 
     # Verify that the stack is correct before trying to land it.
-    verify(st, check_base=True)
+    with status("Verifying stack"):
+        verify(st, check_base=True)
 
     # All good, land the bottommost PR!
     land_pr(st[0], remote=args.remote, target=args.target, verbose=args.verbose, wait_for_merge=wait_for_merge)
 
     if skip_wait:
         # User explicitly skipped waiting, so we skip rebasing
-        log(h("\n⚠️  Skipping rebase of remaining stack (--skip-wait enabled)"), level=1)
-        log("   The first PR has been queued for merge.")
+        print_warning("Skipping rebase of remaining stack (--skip-wait enabled)")
+        console.print("   The first PR has been queued for merge.")
         if len(st) > 1:
-            log(f"   Remaining {len(st) - 1} PR(s) in the stack will need manual rebasing after merge completes.")
+            console.print(f"   Remaining {len(st) - 1} PR(s) in the stack will need manual rebasing after merge completes.")
         run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
         delete_local_branches(st, verbose=args.verbose)
-        log(h(blue("\nMerge initiated! Remember to rebase remaining PRs manually.")))
+        print_info("Merge initiated! Remember to rebase remaining PRs manually.")
         return
 
     # The rest of the stack now needs to be rebased.
     if len(st) > 1:
-        log(h("Rebasing the rest of the stack"), level=1)
-        prs_to_rebase = st[1:]
-        print_stack(prs_to_rebase, links=args.hyperlinks, level=1)
-        for e in prs_to_rebase:
-            rebase_pr(e, remote=args.remote, target=args.target, verbose=args.verbose)
-        # Change the target of the new bottom-most PR in the stack to 'target'
-        run_shell_command(
-            ["gh", "pr", "edit", prs_to_rebase[0].pr, "-B", args.target],
-            quiet=not args.verbose,
-        )
+        with status_group(f"Rebasing remaining {len(st) - 1} PR(s) in the stack"):
+            prs_to_rebase = st[1:]
+            for e in prs_to_rebase:
+                rebase_pr(e, remote=args.remote, target=args.target, verbose=args.verbose)
+            # Change the target of the new bottom-most PR in the stack to 'target'
+            with status(f"Updating base branch of PR #{last(prs_to_rebase[0].pr)}"):
+                run_shell_command(
+                    ["gh", "pr", "edit", prs_to_rebase[0].pr, "-B", args.target],
+                    quiet=not args.verbose,
+                )
 
     # Delete local and remote stack branches
-    run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
-
-    delete_local_branches(st, verbose=args.verbose)
+    with status("Cleaning up local branches"):
+        run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
+        delete_local_branches(st, verbose=args.verbose)
 
     # If local branch {target} exists, rebase it on the remote/target
-    if branch_exists(args.target):
+    with status(f"Rebasing {current_branch} on {args.remote}/{args.target}"):
+        if branch_exists(args.target):
+            run_shell_command(
+                ["git", "rebase", f"{args.remote}/{args.target}", args.target],
+                quiet=not args.verbose,
+            )
         run_shell_command(
-            ["git", "rebase", f"{args.remote}/{args.target}", args.target],
+            ["git", "rebase", f"{args.remote}/{args.target}", current_branch],
             quiet=not args.verbose,
         )
-    run_shell_command(
-        ["git", "rebase", f"{args.remote}/{args.target}", current_branch],
-        quiet=not args.verbose,
-    )
 
-    log(h(blue("SUCCESS!")))
+    print_success("Stack landed successfully!")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1478,7 +1523,7 @@ def strip_metadata(e: StackEntry, *, needs_rebase: bool, verbose: bool) -> str:
 # Entry point for 'abandon' command
 # ===----------------------------------------------------------------------=== #
 def command_abandon(args: CommonArgs) -> None:
-    log(h("ABANDON"))
+    console.print("\n[bold magenta]╭─── ABANDON STACK ───╮[/bold magenta]")
     st = get_stack(base=args.base, head=args.head, verbose=args.verbose)
     if not st:
         log(h("Empty stack!"))
@@ -1621,7 +1666,7 @@ def create_argparser(
     common_parser.add_argument(
         "--branch-name-template",
         default=config.get("repo", "branch_name_template", fallback="$USERNAME/stack"),
-        help="A template for names of the branches stack-pr would use.",
+        help="A template for names of the branches git-stack would use.",
     )
 
     parser_submit = subparsers.add_parser(
@@ -1705,7 +1750,7 @@ def main() -> None:  # noqa: PLR0912
     args = parser.parse_args()
 
     if not args.command:
-        print(h(red("Invalid usage of the stack-pr command.")))
+        print(h(red("Invalid usage of the git-stack command.")))
         parser.print_help()
         return
 

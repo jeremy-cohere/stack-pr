@@ -19,7 +19,7 @@ Example:
 
 ### Dependencies
 
-This is a non-comprehensive list of dependencies required by `stack-pr.py`:
+This is a non-comprehensive list of dependencies required by `git-stack`:
 
 - Install `gh`, e.g., `brew install gh` on MacOS.
 - Run `gh auth login` with SSH
@@ -43,7 +43,7 @@ pipx install .
 
 ## Usage
 
-`stack-pr` allows you to work with stacked PRs: submit, view, and land them.
+`git-stack` (or `git stack`) allows you to work with stacked PRs: submit, view, and land them.
 
 ### Basic Workflow
 
@@ -67,38 +67,38 @@ git commit -m "Second change"
 
 3. Review what will be in your stack:
 ```bash
-stack-pr view  # Always safe to run, helps catch issues early
+git stack view  # Always safe to run, helps catch issues early
 ```
 
 4. Create/update the stack of PRs:
 ```bash
-stack-pr submit
+git stack submit
 ```
 > **Note**: `export` is an alias for `submit`.
 
 5. To update any PR in the stack:
 - Amend the corresponding commit
-- Run `stack-pr view` to verify your changes
-- Run `stack-pr submit` again
+- Run `git stack view` to verify your changes
+- Run `git stack submit` again
 
 6. To rebase your stack on the latest main:
 ```bash
 git checkout my-feature
 git pull origin main  # Get the latest main
 git rebase main       # Rebase your commits on top of main
-stack-pr submit       # Resubmit to update all PRs
+git stack submit       # Resubmit to update all PRs
 ```
 
 7. When your PRs are ready to merge, you have two options:
 
-**Option A**: Using `stack-pr land`:
+**Option A**: Using `git stack land`:
 ```bash
-stack-pr land
+git stack land
 ```
 This will:
 - Merge the bottom-most PR in your stack
 - Automatically rebase your remaining PRs
-- You can run `stack-pr land` again to merge the next PR once CI passes
+- You can run `git stack land` again to merge the next PR once CI passes
 
 **Option B**: Using GitHub web interface:
 1. Merge the bottom-most PR through GitHub UI
@@ -106,22 +106,22 @@ This will:
    ```bash
    git checkout my-feature
    git pull origin main  # Get the merged changes
-   stack-pr submit       # Resubmit the stack to rebase remaining PRs
+   git stack submit       # Resubmit the stack to rebase remaining PRs
    ```
 3. Repeat for each PR in the stack
 
 That's it!
 
-> **Pro-tip**: Run `stack-pr view` frequently - it's a safe command that helps you understand the current state of your stack and catch any potential issues early.
+> **Pro-tip**: Run `git stack view` frequently - it's a safe command that helps you understand the current state of your stack and catch any potential issues early.
 
 ### Commands
 
-`stack-pr` has four main commands:
+`git-stack` (or `git stack`) has four main commands:
 
 - `submit` (or `export`) - create a new stack of PRs from the given set of
-  commits. One can think of this as “push my local changes to the corresponding
+  commits. One can think of this as "push my local changes to the corresponding
   remote branches and update the corresponding PRs (or create new PRs if they
-  don’t exist yet)”.
+  don't exist yet)".
 - `view` - inspect the given set of commits and find the linked PRs. This
   command does not push any changes anywhere and does not change any commits.
   It can be used to examine what other commands did or will do.
@@ -137,8 +137,8 @@ A usual workflow is the following:
 while not ready to merge:
     make local changes
     commit to local git repo or amend existing commits
-    create or update the stack with `stack-pr.py submit`
-merge changes with `stack-pr.py land`
+    create or update the stack with `git stack submit`
+merge changes with `git stack land`
 ```
 
 You can also use `view` at any point to examine the current state, and
@@ -164,7 +164,7 @@ and `-T` respectively and accept the standard git notation: e.g. one can use
 The first step before creating a stack of PRs is to double-check the changes
 we’re going to post.
 
-By default `stack-pr` will look at commits in `main..HEAD` range and will create
+By default `git-stack` will look at commits in `main..HEAD` range and will create
 a PR for every commit in that range.
 
 For instance, if we have
@@ -194,7 +194,7 @@ We can double-check that by running the script with `view` command - it is
 always a safe command to run:
 
 ```bash
-# stack-pr view
+# git stack view
 ...
 VIEW
 **Stack:**
@@ -209,7 +209,7 @@ corresponding PRs and cross-link them. To do that, we run the tool with
 `submit` command:
 
 ```bash
-# stack-pr submit
+# git stack submit
 ...
 SUCCESS!
 ```
@@ -230,7 +230,7 @@ If the command succeeded, we should see “SUCCESS!” in the end, and we can no
 run `view` again to look at the new stack:
 
 ```python
-# stack-pr view
+# git stack view
 ...
 VIEW
 **Stack:**
@@ -249,14 +249,14 @@ feedback), we simply amend the desired changes to the appropriate git commits
 and run `submit` again. If needed, we can rearrange commits or add new ones.
 
 `submit` simply syncs the local changes with the corresponding PRs. This is why
-we use the same `stack-pr submit` command when we create a new stack, rebase our
+we use the same `git stack submit` command when we create a new stack, rebase our
 changes on the latest main, update any PR in the stack, add new commits to the
 stack, or rearrange commits in the stack.
 
 When we are ready to merge our changes, we use `land` command.
 
 ```python
-# stack-pr land
+# git stack land
 LAND
 Stack:
    * cc932b71 (#439, 'ZolotukhinM/stack/103' -> 'ZolotukhinM/stack/102'): Optimized navigation algorithms for deep space travel
@@ -276,7 +276,7 @@ This command lands the first PR of the stack and rebases the rest. If we run
 there:
 
 ```python
-# stack-pr view
+# git stack view
 VIEW
 **Stack:**
    * **8177f347** (#439, 'ZolotukhinM/stack/103' -> 'ZolotukhinM/stack/102'): Optimized navigation algorithms for deep space travel
@@ -293,34 +293,34 @@ the script:
 
 ```bash
 # Submit a stack of last 5 commits
-stack-pr submit -B HEAD~5
+git stack submit -B HEAD~5
 
 # Use 'origin/main' instead of 'main' as the base for the stack
-stack-pr submit -B origin/main
+git stack submit -B origin/main
 
 # Do not include last two commits to the stack
-stack-pr submit -H HEAD~2
+git stack submit -H HEAD~2
 ```
 
-These options work for all script commands (and it’s recommended to first use
+These options work for all script commands (and it's recommended to first use
 them with `view` to double check the result). It is possible to mix and match
 them too - e.g. one can first submit the stack for the last 5 commits and then
 land first three of them:
 
 ```bash
 # Inspect what commits will be included HEAD~5..HEAD
-stack-pr view -B HEAD~5
+git stack view -B HEAD~5
 # Create a stack from last five commits
-stack-pr submit -B HEAD~5
+git stack submit -B HEAD~5
 
 # Inspect what commits will be included into the range HEAD~5..HEAD~2
-stack-pr view -B HEAD~5 -H HEAD~2
+git stack view -B HEAD~5 -H HEAD~2
 # Land first three PRs from the stack
-stack-pr land -B HEAD~5 -H HEAD~2
+git stack land -B HEAD~5 -H HEAD~2
 ```
 
 Note that generally one doesn't need to specify the base and head branches
-explicitly - `stack-pr` will figure out the correct range based on the current
+explicitly - `git-stack` will figure out the correct range based on the current
 branch and the remote `main` by default.
 
 ## Command Line Options Reference

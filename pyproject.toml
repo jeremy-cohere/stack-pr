@@ -47,7 +47,7 @@ Repository = "https://github.com/modular/stack-pr"
 "Bug Tracker" = "https://github.com/modular/stack-pr/issues"
 
 [project.scripts]
-stack-pr = "stack_pr.cli:main"
+git-stack = "stack_pr.cli:main"
 
 [build-system]
 requires = ["pdm-backend"]
