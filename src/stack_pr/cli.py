@@ -1279,47 +1279,67 @@ def wait_for_pr_merge(e: StackEntry, *, timeout: int = 1800, poll_interval: int 
     Raises:
         TimeoutError: If the PR is not merged within the timeout period.
         RuntimeError: If the PR state becomes invalid (e.g., closed without merging).
+        KeyboardInterrupt: If user cancels the wait (with confirmation).
     """
     pr_id = "#" + last(e.pr)
     start_time = time.time()
+    interrupt_count = 0
 
     with console.status(
         f"[bold yellow]⏳ Waiting for PR {pr_id} to merge...[/bold yellow]",
         spinner="dots"
     ) as status_obj:
         while True:
-            elapsed = time.time() - start_time
-            if elapsed > timeout:
-                raise TimeoutError(
-                    f"PR {e.pr} did not merge within {timeout} seconds. "
-                    "It may still be in the merge queue."
+            try:
+                elapsed = time.time() - start_time
+                if elapsed > timeout:
+                    raise TimeoutError(
+                        f"PR {e.pr} did not merge within {timeout} seconds. "
+                        "It may still be in the merge queue."
+                    )
+
+                # Update status with elapsed time
+                minutes_elapsed = int(elapsed / 60)
+                seconds_elapsed = int(elapsed % 60)
+                status_obj.update(
+                    f"[bold yellow]⏳ Waiting for PR {pr_id} to merge... "
+                    f"({minutes_elapsed}m {seconds_elapsed}s elapsed)[/bold yellow]"
                 )
 
-            # Update status with elapsed time
-            minutes_elapsed = int(elapsed / 60)
-            seconds_elapsed = int(elapsed % 60)
-            status_obj.update(
-                f"[bold yellow]⏳ Waiting for PR {pr_id} to merge... "
-                f"({minutes_elapsed}m {seconds_elapsed}s elapsed)[/bold yellow]"
-            )
-
-            # Check PR status
-            pr_info = get_command_output(
-                ["gh", "pr", "view", e.pr, "--json", "state,mergedAt"]
-            )
-            d = json.loads(pr_info)
-
-            if d["state"] == "MERGED" and d["mergedAt"]:
-                # Success message will be shown by the caller
-                return
-
-            if d["state"] == "CLOSED":
-                raise RuntimeError(
-                    f"PR {e.pr} was closed without merging. Cannot continue landing."
+                # Check PR status
+                pr_info = get_command_output(
+                    ["gh", "pr", "view", e.pr, "--json", "state,mergedAt"]
                 )
+                d = json.loads(pr_info)
 
-            # Still open, wait and poll again
-            time.sleep(poll_interval)
+                if d["state"] == "MERGED" and d["mergedAt"]:
+                    # Success message will be shown by the caller
+                    return
+
+                if d["state"] == "CLOSED":
+                    raise RuntimeError(
+                        f"PR {e.pr} was closed without merging. Cannot continue landing."
+                    )
+
+                # Still open, wait and poll again
+                time.sleep(poll_interval)
+
+            except KeyboardInterrupt:
+                interrupt_count += 1
+                if interrupt_count == 1:
+                    # First interrupt - ask for confirmation
+                    console.print("\n")
+                    print_warning("Wait interrupted! Press Ctrl+C again to stop waiting for merge.")
+                    console.print("   The PR will remain in the merge queue.")
+                    console.print("   You can run 'git stack sync' after it merges to update your local branches.\n")
+                    # Reset the status spinner
+                    status_obj.update(
+                        f"[bold yellow]⏳ Waiting for PR {pr_id} to merge... "
+                        f"(Press Ctrl+C again to exit)[/bold yellow]"
+                    )
+                else:
+                    # Second interrupt - exit gracefully
+                    raise
 
 
 def land_pr(e: StackEntry, remote: str, target: str, *, verbose: bool, wait_for_merge: bool = False) -> None:
@@ -1438,7 +1458,22 @@ def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
         verify(st, check_base=True)
 
     # All good, land the bottommost PR!
-    land_pr(st[0], remote=args.remote, target=args.target, verbose=args.verbose, wait_for_merge=wait_for_merge)
+    try:
+        land_pr(st[0], remote=args.remote, target=args.target, verbose=args.verbose, wait_for_merge=wait_for_merge)
+    except KeyboardInterrupt:
+        # User cancelled the wait with double Ctrl+C
+        console.print("\n")
+        print_warning("Wait cancelled! The PR has been queued for merge.")
+        run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
+        delete_local_branches(st, verbose=args.verbose)
+        console.print("\n[bold cyan]💡 Next steps:[/bold cyan]")
+        console.print("   1. Wait for the PR to merge on GitHub")
+        console.print("   2. Run [bold]'git stack sync'[/bold] to update your local branches")
+        if len(st) > 1:
+            console.print(f"   3. Manually rebase the remaining {len(st) - 1} PR(s) in your stack\n")
+        else:
+            console.print()
+        return
 
     if skip_wait:
         # User explicitly skipped waiting, so we skip rebasing
