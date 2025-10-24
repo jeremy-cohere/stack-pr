@@ -45,6 +45,17 @@
 # Close the corresponding PR, delete the remote and local branch, remove the
 # stack-info from commit message.
 #
+# ---------------
+# git stack sync
+# ---------------
+#
+# Semantics:
+# Sync local branches with remote after manual PR merges.
+# Useful after 'land --skip-wait' or manual GitHub UI merges.
+#  1. Fetch from remote
+#  2. Rebase local target branch on remote/target (if it exists)
+#  3. Rebase current branch on remote/target
+#
 # ===----------------------------------------------------------------------=== #
 
 from __future__ import annotations
@@ -1437,7 +1448,7 @@ def command_land(args: CommonArgs, *, skip_wait: bool = False) -> None:
             console.print(f"   Remaining {len(st) - 1} PR(s) in the stack will need manual rebasing after merge completes.")
         run_shell_command(["git", "checkout", current_branch], quiet=not args.verbose)
         delete_local_branches(st, verbose=args.verbose)
-        print_info("Merge initiated! Remember to rebase remaining PRs manually.")
+        print_info("Merge initiated! After the PR merges, run 'git stack sync' to update your local branches.")
         return
 
     # The rest of the stack now needs to be rebased.
@@ -1564,6 +1575,45 @@ def command_abandon(args: CommonArgs) -> None:
         branch_name_template=args.branch_name_template,
     )
     log(h(blue("SUCCESS!")))
+
+
+# ===----------------------------------------------------------------------=== #
+# SYNC
+# ===----------------------------------------------------------------------=== #
+def command_sync(args: CommonArgs) -> None:
+    """Sync local branches with remote after manual PR merges.
+
+    This command is useful after:
+    - Running 'git stack land --skip-wait'
+    - Manually merging PRs via GitHub UI
+    - Any situation where remote has changes you want to sync locally
+
+    It will:
+    1. Fetch from remote
+    2. Rebase local target branch on remote/target (if it exists)
+    3. Rebase current branch on remote/target
+    """
+    console.print("\n[bold magenta]╭─── SYNC STACK ───╮[/bold magenta]")
+
+    current_branch = get_current_branch_name()
+
+    # Fetch latest changes from remote
+    with status(f"Fetching from {args.remote}"):
+        run_shell_command(["git", "fetch", "--prune", args.remote], quiet=not args.verbose)
+
+    # Rebase local target branch if it exists
+    with status(f"Rebasing {current_branch} on {args.remote}/{args.target}"):
+        if branch_exists(args.target):
+            run_shell_command(
+                ["git", "rebase", f"{args.remote}/{args.target}", args.target],
+                quiet=not args.verbose,
+            )
+        run_shell_command(
+            ["git", "rebase", f"{args.remote}/{args.target}", current_branch],
+            quiet=not args.verbose,
+        )
+
+    print_success("Local branches synced successfully!")
 
 
 # ===----------------------------------------------------------------------=== #
@@ -1731,6 +1781,11 @@ def create_argparser(
         help="Inspect the current stack",
         parents=[common_parser],
     )
+    subparsers.add_parser(
+        "sync",
+        help="Sync local branches with remote (useful after manual merges or land --skip-wait)",
+        parents=[common_parser],
+    )
 
     return parser
 
@@ -1788,6 +1843,8 @@ def main() -> None:  # noqa: PLR0912
             command_abandon(common_args)
         elif args.command == "view":
             command_view(common_args)
+        elif args.command == "sync":
+            command_sync(common_args)
         else:
             print(h(red("Unknown command: " + args.command)))
             return
